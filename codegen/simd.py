@@ -663,6 +663,8 @@ class SIMDKernel(Kernel):
             for x, g in zip(lengths, groups)
         ):
             return set_ranges(*lengths)
+        elif config.aggressive_tiling_fusion:
+            return set_ranges(*lengths)
 
         new_ranges, return_getters_groups = cls._split_iteration_ranges(groups, lengths)
         itervars = [*itertools.chain.from_iterable(set_ranges(*new_ranges))]
@@ -1117,12 +1119,20 @@ class SIMDScheduling(BaseScheduling):
 
         def fits_in_main_body(n):
             _, (node_numel, node_rnumel) = n.group
+            ############################# WELDER / ASTITCH #################################
+            if config.aggressive_tiling_fusion:
+                tiling = self.select_tiling(node.get_nodes(), node_numel, node_rnumel)
+                return tiling['x'] == numel and rnumel!=1
             return (node_numel == numel and node_rnumel == rnumel) or (
                 node_numel == numel * rnumel and node_rnumel == 1
             )
 
         def fits_outside_reduction(n):
             _, (node_numel, node_rnumel) = n.group
+            ############################# WELDER / ASTITCH #################################
+            # if config.aggressive_tiling_fusion:
+            #     tiling = self.select_tiling(node.get_nodes(), node_numel, node_rnumel)
+            #     return tiling['x'] == numel and rnumel!=1
             return node_numel == numel and node_rnumel == 1 and rnumel != 1
 
         def expect_improved_memory_usage(n):
