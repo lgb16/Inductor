@@ -1120,9 +1120,11 @@ class SIMDScheduling(BaseScheduling):
         def fits_in_main_body(n):
             _, (node_numel, node_rnumel) = n.group
             ############################# WELDER / ASTITCH #################################
-            if config.aggressive_tiling_fusion:
-                tiling = self.select_tiling(node.get_nodes(), node_numel, node_rnumel)
-                return tiling['x'] == numel and rnumel!=1
+            # if config.aggressive_tiling_fusion:
+            #     tiling = self.select_tiling(node.get_nodes(), node_numel, node_rnumel)
+            #     return (tiling['x'] == numel and rnumel!=1) or ((node_numel == numel and node_rnumel == rnumel) or (
+            #     node_numel == numel * rnumel and node_rnumel == 1
+            # ))
             return (node_numel == numel and node_rnumel == rnumel) or (
                 node_numel == numel * rnumel and node_rnumel == 1
             )
@@ -1130,9 +1132,9 @@ class SIMDScheduling(BaseScheduling):
         def fits_outside_reduction(n):
             _, (node_numel, node_rnumel) = n.group
             ############################# WELDER / ASTITCH #################################
-            # if config.aggressive_tiling_fusion:
-            #     tiling = self.select_tiling(node.get_nodes(), node_numel, node_rnumel)
-            #     return tiling['x'] == numel and rnumel!=1
+            if config.aggressive_tiling_fusion:
+                tiling = self.select_tiling(node.get_nodes(), node_numel, node_rnumel)
+                return tiling['x'] == numel and rnumel!=1
             return node_numel == numel and node_rnumel == 1 and rnumel != 1
 
         def expect_improved_memory_usage(n):
@@ -1256,12 +1258,36 @@ class SIMDScheduling(BaseScheduling):
         for size in buf_sizes:
             V.graph.sizevars.guard_leq(size, int_max)  # type: ignore[arg-type]
         return True
+    
+    def get_all_tiling_info(self, node_schedule):
+        all_tiling_info = {}
+        for node in node_schedule:
+            if not isinstance(node, scheduler.SchedulerNode):
+                continue
+            _, (numel, rnumel) = node.group
+            tiling = self.select_tiling(node.get_nodes(), numel, rnumel)
+            for key, val in tiling.items():
+                if key in all_tiling_info:
+                    existing = all_tiling_info[key]
+                    if key == 'r':
+                        if existing == 1 and val != 1:
+                            all_tiling_info[key] = val
+                        assert (existing == val) or (existing != 1 and val == 1), f"WELDER / ASTITCH - get_all_tiling_info : mismatch rnumel {existing} and {val}"
+                    else:
+                        assert (existing == val), f"WELDER / ASTITCH - get_all_tiling_info : mismatch {key}numel {existing} and {val}"
+                else:
+                    all_tiling_info[key] = val
+        return all_tiling_info
 
     def codegen_node_schedule(self, kernel_features: SIMDKernelFeatures):
         node_schedule = kernel_features.node_schedule
-        tiling = self.select_tiling(
-            node_schedule, kernel_features.numel, kernel_features.reduction_numel
-        )
+        ############################## WELDER / ASTITCH ############################
+        if config.aggressive_tiling_fusion:
+            tiling = self.get_all_tiling_info(node_schedule)
+        else:
+            tiling = self.select_tiling(
+                node_schedule, kernel_features.numel, kernel_features.reduction_numel
+            )
         kernels = self.create_kernel_choices(
             kernel_features, [tiling], {"features": kernel_features}
         )
