@@ -2220,7 +2220,11 @@ class TritonKernel(SIMDKernel):
         value: Union[CSEVariable, Tuple[CSEVariable, ...]],
     ) -> Union[CSEVariable, Tuple[CSEVariable, ...]]:
         assert self.inside_reduction
-        masks = OrderedSet(f"{tree.prefix}mask" for tree in self.range_trees)
+        ############################### WELDER / ASTITCH ###################################
+        if config.aggressive_tiling_fusion:
+            masks = OrderedSet(f"{tree.prefix}mask" for tree in self.range_trees if tree.prefix in self.numels.keys())
+        else:
+            masks = OrderedSet(f"{tree.prefix}mask" for tree in self.range_trees)
         self.filter_masks(masks)
         masks = sorted(masks)
         if self._load_mask:
@@ -3210,12 +3214,11 @@ class TritonKernel(SIMDKernel):
             heuristics_line = f"""
                 @triton_heuristics.user_autotune(
                     configs=[
-                        {{'kwargs': {{'XBLOCK': 1}}, 'num_warps':4, 'num_stages':2}},
-                        {{'kwargs': {{'XBLOCK': 2}}, 'num_warps':4, 'num_stages':2}},
-                        {{'kwargs': {{'XBLOCK': 4}}, 'num_warps':4, 'num_stages':2}},
-                        {{'kwargs': {{'XBLOCK': 8}}, 'num_warps':4, 'num_stages':2}},
-                        {{'kwargs': {{'XBLOCK': 16}}, 'num_warps':4, 'num_stages':2}},
-                        {{'kwargs': {{'XBLOCK': 32}}, 'num_warps':4, 'num_stages':2}}                                 
+                        {{'kwargs': {{'XBLOCK':1, 'YBLOCK':1}}, 'num_warps':2, 'num_stages':2}},
+                        {{'kwargs': {{'XBLOCK':16, 'YBLOCK':32}}, 'num_warps':4, 'num_stages':2}},
+                        {{'kwargs': {{'XBLOCK':64, 'YBLOCK':32}}, 'num_warps':4, 'num_stages':2}},
+                        {{'kwargs': {{'XBLOCK':16, 'YBLOCK':64}}, 'num_warps':4, 'num_stages':2}},
+                        {{'kwargs': {{'XBLOCK':32, 'YBLOCK':64}}, 'num_warps':4, 'num_stages':2}},                            
                     ],
                     filename=__file__,
                     triton_meta={triton_meta!r},
