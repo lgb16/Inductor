@@ -402,8 +402,25 @@ class SIMDKernel(Kernel):
     def initialize_range_tree(self, pid_cache):
         no_r_dim = not self.inside_reduction or self.numels["r"] == 1
 
+        ################################ WELDER / ASTITCH ###########################
         prefixes = "zyxr"
-        active_prefixes = prefixes[-len(self.numels) :]
+        all_numels_info = {}
+        if config.aggressive_tiling_fusion:
+            for node, tile in self.tile_map.items():
+                for prefix, value in tile.items():
+                    if prefix in all_numels_info:
+                        if prefix == 'r':
+                            if all_numels_info[prefix]==1 and value != 1:
+                                all_numels_info[prefix]=value
+                            assert all_numels_info[prefix]==value or (all_numels_info != 1 and value == 1), f"WELDER / ASTITCH - initialize_range_tree : mismatch rnumel {all_numels_info[prefix]} and {value}"
+                        else:
+                            assert all_numels_info[prefix]==value, f"WELDER / ASTITCH - initialize_range_tree : mismatch {prefix}numel {all_numels_info[prefix]} and {value}"
+                        continue
+                    all_numels_info[prefix]=value
+            active_prefixes = prefixes[-len(all_numels_info) :]
+        else:
+            active_prefixes = prefixes[-len(self.numels) :]
+        ############################################################################
 
         grid_dims = "xyz"
         if self.no_x_dim:
@@ -423,7 +440,7 @@ class SIMDKernel(Kernel):
             self.range_trees.append(
                 IterationRangesRoot(
                     f"{prefix}index",
-                    self.numels[prefix],
+                    all_numels_info[prefix],
                     prefix,
                     index,
                     self,
