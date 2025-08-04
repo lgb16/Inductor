@@ -357,6 +357,7 @@ class SIMDKernel(Kernel):
         self.numels = {
             prefix: V.graph.sizevars.simplify(val) for prefix, val in tiling.items()
         }
+        self.saved_numels = self.numels
         self.tile_map = {
             node : {prefix: V.graph.sizevars.simplify(val) for prefix, val in tile.items()} for node, tile in tile_map.items()
         }
@@ -398,6 +399,15 @@ class SIMDKernel(Kernel):
 
     def want_no_x_dim(self):
         return False
+    
+    def set_numels(self, tiling):
+        self.numels = {
+            prefix: V.graph.sizevars.simplify(val) for prefix, val in tiling.items()
+        }
+
+    def reset_numels(self):
+        self.numels = self.saved_numels
+
 
     def initialize_range_tree(self, pid_cache):
         no_r_dim = not self.inside_reduction or self.numels["r"] == 1
@@ -436,8 +446,12 @@ class SIMDKernel(Kernel):
             is_reduction = prefix_is_reduction(prefix)
             tensor_dim = tensor_dims.find(prefix) if prefix in tensor_dims else None
             grid_dim = None if is_reduction else grid_dims.find(prefix)
-            index = i if grid_dim is None else grid_dim
-            self.range_trees.append(
+            ################################ WELDER / ASTITCH ###########################
+            if config.aggressive_tiling_fusion:
+                index = config.triton.max_tiles - 1 if grid_dim is None else grid_dim
+                if tensor_dim >= config.triton.max_tiles:
+                    tensor_dim = config.triton.max_tiles - 1
+                self.range_trees.append(
                 IterationRangesRoot(
                     f"{prefix}index",
                     all_numels_info[prefix],
@@ -451,6 +465,23 @@ class SIMDKernel(Kernel):
                     has_zdim="z" in active_prefixes,
                 )
             )
+            ############################################################################
+            else:
+                index = i if grid_dim is None else grid_dim
+                self.range_trees.append(
+                    IterationRangesRoot(
+                        f"{prefix}index",
+                        self.numels[prefix],
+                        prefix,
+                        index,
+                        self,
+                        pid_cache=pid_cache,
+                        is_loop=is_reduction and not self.persistent_reduction,
+                        tensor_dim=tensor_dim,
+                        grid_dim=grid_dim,
+                        has_zdim="z" in active_prefixes,
+                    )
+                )
 
     def finalize_indexing(self, indices: Sequence[sympy.Expr]):
         """
@@ -480,6 +511,9 @@ class SIMDKernel(Kernel):
         )
 
     def triton_tensor_ndim(self):
+        ############################ WELDER / ASTITCH #######################################
+        if config.aggressive_tiling_fusion:
+            return len({tree.tensor_dim for tree in self.range_trees if tree.tensor_dim is not None})
         return sum(int(tree.tensor_dim is not None) for tree in self.range_trees)
 
     def indexing_size_str(self, i):
@@ -729,15 +763,16 @@ class SIMDKernel(Kernel):
         # If the index variables only iterate over a subset of the kernel
         # numels, then it must be broadcasted.
         simplify = V.graph.sizevars.simplify
-        if config.aggressive_tiling_fusion:
-            return (
-                sum(
-                    1
-                    for idx_range, iter_range in zip(index_numels, self.numels.values())
-                    if simplify(idx_range) == simplify(iter_range)  # type: ignore[arg-type]
-                )
-                >= config.triton.max_tiles
-            )
+        ############################ WELDER / ASTITCH ################################
+        # if config.aggressive_tiling_fusion:
+        #     return (
+        #         sum(
+        #             1
+        #             for idx_range, iter_range in zip(index_numels, self.numels.values())
+        #             if simplify(idx_range) == simplify(iter_range)  # type: ignore[arg-type]
+        #         )
+        #         >= config.triton.max_tiles
+        #     )
         return any(
             simplify(idx_range) != simplify(iter_range)  # type: ignore[arg-type]
             for idx_range, iter_range in zip(index_numels, self.numels.values())
@@ -1338,12 +1373,12 @@ class SIMDScheduling(BaseScheduling):
 
     def codegen_node_schedule(self, kernel_features: SIMDKernelFeatures):
         node_schedule = kernel_features.node_schedule
-        if config.aggressive_tiling_fusion:
-            tiling = self.get_all_tiling_info(node_schedule)
-        else:
-            tiling = self.select_tiling(
-                node_schedule, kernel_features.numel, kernel_features.reduction_numel
-            )
+        # if config.aggressive_tiling_fusion:
+        #     tiling = self.get_all_tiling_info(node_schedule)
+        # else:
+        tiling = self.select_tiling(
+            node_schedule, kernel_features.numel, kernel_features.reduction_numel
+        )
         ############################## WELDER / ASTITCH ############################
         tile_map = self.get_tile_map(node_schedule)
 
@@ -1453,7 +1488,10 @@ class SIMDScheduling(BaseScheduling):
                         index_vars = kernel.split_and_set_ranges_with_node(node)
                     else:
                         index_vars = kernel.split_and_set_ranges(node.get_ranges())
+                    _, (numel, rnumel) = node.group
+                    kernel.set_numels(self.select_tiling(node.get_nodes(), numel, rnumel))
                     node.codegen(index_vars)
+                    kernel.reset_numels()
 
     def codegen_template(
         self, template_node, epilogue_nodes, only_gen_src_code=False
