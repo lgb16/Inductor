@@ -575,6 +575,18 @@ class SIMDKernel(Kernel):
             for length, ranges in zip(lengths, self.range_trees)
         ]
 
+    ############################## WELDER / ASTITCH ################################# 
+    def set_ranges_with_node(self, node: BaseSchedulerNode):
+        def _set_ranges(*lengths):
+            #assert len(lengths) == len(self.range_trees)
+            using_range_trees = [rt for rt in self.range_trees if rt.prefix in self.tile_map[node]]
+            assert len(lengths) == len(using_range_trees)
+            return [
+                ranges.construct(length)
+                for length, ranges in zip(lengths, using_range_trees)
+            ]
+        return _set_ranges
+
     @staticmethod
     def _split_iteration_ranges(
         groups: Iterable[sympy.Expr], lengths: Sequence[Sequence[sympy.Expr]]
@@ -659,6 +671,13 @@ class SIMDKernel(Kernel):
             groups[-1] = sympy.S.One
 
         return self.map_kernel_groups_to_node_sizes(groups, lengths, self.set_ranges)
+    
+    def split_and_set_ranges_with_node(self, node: BaseSchedulerNode):
+        groups = [value for value in self.tile_map[node].values()]
+        if not self.inside_reduction:
+            groups[-1] = sympy.S.One
+
+        return self.map_kernel_groups_to_node_sizes(groups, node.get_ranges(), self.set_ranges_with_node(node))
 
     @classmethod
     def map_kernel_groups_to_node_sizes(
@@ -683,8 +702,6 @@ class SIMDKernel(Kernel):
             V.graph.sizevars.simplify(sympy_product(x) - g) == 0
             for x, g in zip(lengths, groups)
         ):
-            return set_ranges(*lengths)
-        elif config.aggressive_tiling_fusion:
             return set_ranges(*lengths)
 
         new_ranges, return_getters_groups = cls._split_iteration_ranges(groups, lengths)
@@ -712,6 +729,15 @@ class SIMDKernel(Kernel):
         # If the index variables only iterate over a subset of the kernel
         # numels, then it must be broadcasted.
         simplify = V.graph.sizevars.simplify
+        if config.aggressive_tiling_fusion:
+            return (
+                sum(
+                    1
+                    for idx_range, iter_range in zip(index_numels, self.numels.values())
+                    if simplify(idx_range) == simplify(iter_range)  # type: ignore[arg-type]
+                )
+                >= config.triton.max_tiles
+            )
         return any(
             simplify(idx_range) != simplify(iter_range)  # type: ignore[arg-type]
             for idx_range, iter_range in zip(index_numels, self.numels.values())
@@ -1312,9 +1338,12 @@ class SIMDScheduling(BaseScheduling):
 
     def codegen_node_schedule(self, kernel_features: SIMDKernelFeatures):
         node_schedule = kernel_features.node_schedule
-        tiling = self.select_tiling(
-            node_schedule, kernel_features.numel, kernel_features.reduction_numel
-        )
+        if config.aggressive_tiling_fusion:
+            tiling = self.get_all_tiling_info(node_schedule)
+        else:
+            tiling = self.select_tiling(
+                node_schedule, kernel_features.numel, kernel_features.reduction_numel
+            )
         ############################## WELDER / ASTITCH ############################
         tile_map = self.get_tile_map(node_schedule)
 
@@ -1398,7 +1427,11 @@ class SIMDScheduling(BaseScheduling):
                     stack.close()
                 else:
                     node.decide_inplace_update()
-                    index_vars = kernel.split_and_set_ranges(node.get_ranges())
+                    ####################### WELDER / ASTITCH ############################
+                    if config.aggressive_tiling_fusion:
+                        index_vars = kernel.split_and_set_ranges_with_node(node)
+                    else:
+                        index_vars = kernel.split_and_set_ranges(node.get_ranges())
                     all_indexing.update(
                         dict.fromkeys(
                             node._body.indexing_from_args(index_vars).values()
@@ -1416,7 +1449,10 @@ class SIMDScheduling(BaseScheduling):
                 else:
                     # TODO - use split ranges ?
                     indexing_dtype_strength_reduction(node._body)
-                    index_vars = kernel.split_and_set_ranges(node.get_ranges())
+                    if config.aggressive_tiling_fusion:
+                        index_vars = kernel.split_and_set_ranges_with_node(node)
+                    else:
+                        index_vars = kernel.split_and_set_ranges(node.get_ranges())
                     node.codegen(index_vars)
 
     def codegen_template(
