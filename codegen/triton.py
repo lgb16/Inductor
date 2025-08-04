@@ -1522,6 +1522,7 @@ class TritonKernel(SIMDKernel):
     def __init__(
         self,
         tiling: Dict[str, sympy.Expr],
+        tile_map: Dict[BaseSchedulerNode, Dict[str,sympy.Expr]],
         min_elem_per_thread=0,
         optimize_mask=True,
         fixed_config: Optional[FixedTritonConfig] = None,
@@ -1529,7 +1530,7 @@ class TritonKernel(SIMDKernel):
     ) -> None:
         self.optimize_mask: bool = optimize_mask
         self.fixed_config = fixed_config
-        super().__init__(tiling, **kwargs)
+        super().__init__(tiling, tile_map, **kwargs)
         self.cse = TritonCSE(self.newvar_prefix, self.suffix)
         self.post_loop_combine: IndentedBuffer = IndentedBuffer()
         self.post_loop_store: IndentedBuffer = IndentedBuffer()

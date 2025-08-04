@@ -341,6 +341,7 @@ class SIMDKernel(Kernel):
     def __init__(
         self,
         tiling: Dict[str, sympy.Expr],
+        tile_map: Dict[BaseSchedulerNode, Dict[str,sympy.Expr]],
         features: SIMDKernelFeatures,
         pid_cache=None,
         override_persistent_reduction=None,
@@ -355,6 +356,9 @@ class SIMDKernel(Kernel):
         self.indexing_code = IndentedBuffer()
         self.numels = {
             prefix: V.graph.sizevars.simplify(val) for prefix, val in tiling.items()
+        }
+        self.tile_map = {
+            node : {prefix: V.graph.sizevars.simplify(val) for prefix, val in tile.items()} for node, tile in tile_map.items()
         }
         self.range_trees: List[IterationRangesRoot] = []
         self.range_tree_nodes: Dict[sympy.Symbol, IterationRangesEntry] = {}
@@ -1278,18 +1282,27 @@ class SIMDScheduling(BaseScheduling):
                 else:
                     all_tiling_info[key] = val
         return all_tiling_info
+    
+    def get_tile_map(self, node_schedule):
+        tile_map = {}
+        for node in node_schedule:
+            if not isinstance(node, scheduler.SchedulerNode):
+                continue
+            _, (numel, rnumel) = node.group
+            tiling = self.select_tiling(node.get_nodes(), numel, rnumel)
+            tile_map[node] = tiling
+        return tile_map
 
     def codegen_node_schedule(self, kernel_features: SIMDKernelFeatures):
         node_schedule = kernel_features.node_schedule
+        tiling = self.select_tiling(
+            node_schedule, kernel_features.numel, kernel_features.reduction_numel
+        )
         ############################## WELDER / ASTITCH ############################
-        if config.aggressive_tiling_fusion:
-            tiling = self.get_all_tiling_info(node_schedule)
-        else:
-            tiling = self.select_tiling(
-                node_schedule, kernel_features.numel, kernel_features.reduction_numel
-            )
+        tile_map = self.get_tile_map(node_schedule)
+
         kernels = self.create_kernel_choices(
-            kernel_features, [tiling], {"features": kernel_features}
+            kernel_features, [tiling, tile_map], {"features": kernel_features}
         )
         for kernel in kernels:
             self.codegen_node_schedule_with_kernel(node_schedule, kernel)
