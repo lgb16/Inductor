@@ -357,10 +357,12 @@ class SIMDKernel(Kernel):
         self.numels = {
             prefix: V.graph.sizevars.simplify(val) for prefix, val in tiling.items()
         }
+        ###################################################
         self.saved_numels = self.numels
         self.tile_map = {
             node : {prefix: V.graph.sizevars.simplify(val) for prefix, val in tile.items()} for node, tile in tile_map.items()
         }
+        #####################################################
         self.range_trees: List[IterationRangesRoot] = []
         self.range_tree_nodes: Dict[sympy.Symbol, IterationRangesEntry] = {}
         self.iter_vars_count = itertools.count()
@@ -1157,6 +1159,11 @@ class SIMDScheduling(BaseScheduling):
 
         if not node1.is_reduction() and node2.is_reduction():
             assert rnumel1 == 1 and rnumel2 != 1
+            #################################### WELDER / ASTITCH ################################
+            # if config.aggressive_tiling_fusion:
+            #     node1_tiling = self.select_tiling(node1.get_nodes(), numel1, rnumel1)
+            #     node2_tiling = self.select_tiling(node2.get_nodes(), numel2, rnumel2)
+
             if numel1 == numel2 * rnumel2:
                 if not all(
                     SIMDKernel.is_compatible((numel2, rnumel2), n.get_ranges())

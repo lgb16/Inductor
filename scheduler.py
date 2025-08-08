@@ -1860,6 +1860,10 @@ class Scheduler:
             self.name_to_fused_node,
         )
 
+        #############################################
+        self.print_nodes_var_ranges()
+        ##############################################
+
         metrics.ir_nodes_pre_fusion += len(self.nodes)
         V.debug.ir_pre_fusion(self.nodes)
         self.num_orig_nodes = len(self.nodes)
@@ -1890,6 +1894,10 @@ class Scheduler:
         V.debug.ir_post_fusion(self.nodes)
         V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
+
+        #############################################
+        # self.print_nodes_var_ranges()
+        ##############################################
 
         # used during codegen:
         self.buffer_names_to_free: OrderedSet[str] = OrderedSet()
@@ -3683,6 +3691,25 @@ class Scheduler:
                         and buffer.get_size() == []
                     ):
                         V.graph.zero_dim_cpu_tensor_list.add(read.name)
+
+    ####################################### WELDER / ASTITCH #######################################
+    def print_nodes_var_ranges(self) -> None:
+        for node in self.nodes:
+            if not isinstance(node, (SchedulerNode, FusedSchedulerNode)):
+                continue
+            # for node in nodes.get_nodes():
+            #     # var_ranges = node._body.var_ranges
+            #     # indexing_exprs = node._body.indexing_exprs
+
+            #     should_normalize = not config.loop_ordering_after_fusion
+
+            #     # dep = dependencies.extract_read_writes(
+            #     #     node._body, *node._sizes, normalize=should_normalize
+            #     # )
+            print(node.get_name())
+            print(node.read_writes.reads)
+            print(node.read_writes.writes)
+            print('\n')
 
 
 class BaseScheduling:
