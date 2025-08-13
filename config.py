@@ -533,6 +533,8 @@ fusion_zero_shared_data = False
 
 ignore_can_fuse = False
 aggressive_tiling_fusion = False
+
+switch_debuging_code = False
 ##########################################################################################
 
 
