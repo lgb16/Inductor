@@ -850,8 +850,57 @@ class BaseSchedulerNode:
     def get_template_node(self) -> Optional[ir.TemplateBuffer]:
         return None
 
+    def propagate_default_tile(self):
+        var_in_reads = set([name for dep in self.read_writes.reads for name in dep.index.free_symbols])
+        var_in_writes = set([name for dep in self.read_writes.writes for name in dep.index.free_symbols])
+
+        common_vars = var_in_reads & var_in_writes
+
+        updated_range_vars = {
+            key: 1 if key in common_vars else value
+            for key, value in self.read_writes.var_ranges.items()
+        }
+
+        name_to_tile: Dict[str, Dict[sympy.Symbol, sympy.Expr]] = {}
+        for dep in self.read_writes.reads_and_writes():
+            name_to_tile[dep.name] = {}
+            for name in dep.index.free_symbols:
+                range_vars = updated_range_vars.get(name)
+                if range_vars is None:
+                    continue
+                name_to_tile[dep.name][name] = range_vars
+        ## TODO
+        ## dep가 StarDep, WeakDep인 경우의 handling
+        ## inderect로 생성되는 tmp handling
+
+        return name_to_tile
+
+    def propagate_output_tile(self, tile_var_ranges: Dict[str, Dict[sympy.Symbol, sympy.Expr]]):
+        default_tile_ranges = self.propagate_default_tile()
+
+        for buf_name, tile_range in default_tile_ranges.items():
+            p_tile_range = tile_var_ranges.get(buf_name)
+            if p_tile_range is None:
+                continue
+            for var, size in tile_range.items():
+                if size == 1 and p_tile_range[var] != 1:
+                    tile_range[var] = p_tile_range[var]
+                elif size != 1 and p_tile_range[var] == 1:
+                    ## TODO
+                    ## reduction에 대한 propagate handling
+                    continue
+                elif size == p_tile_range[var]:
+                    continue
+                else:
+                    ## default tile size는 항상 1을 가져간다고 가정
+                    ## p_tile_range는 propagate해서 온 결과이기 때문에 임의의 size를 가질 수 있지만,
+                    ## tile_range는 default_tile을 계산했기 떄문에 1 또는 tensor_size의 값만을 가짐(가정)
+                    return None
+        return default_tile_ranges
+
 
 class WhyNoFuse:
+
     # TODO when we drop support for Python < 3.10, we can use
     # @dataclass(slots=True) instead of manually specifying __slots__.
     __slots__ = ["node1", "node2", "reason", "args"]
@@ -1067,6 +1116,8 @@ class SchedulerNode(BaseSchedulerNode):
         self_sizes = self._sizes[0]
         if len(self_sizes) == self_dep.num_vars == other_dep.num_vars:
             new_order = self_dep.decide_loop_order_to_match(other_dep)
+            if not new_order and config.common_indexing_fusion:
+                new_order = self_dep.decide_loop_order_with_index(other_dep)   
 
         if new_order:
             metrics.num_loop_reordering += 1
@@ -3151,6 +3202,87 @@ class Scheduler:
 
         return self.score_fusion_memory(node1, node2)
 
+    #################################### WELDER / ASTITCH #######################################
+
+    def compare_dep_with_free_symbol(
+        self, dep1: Dep, dep2: Dep
+    ) -> bool:
+        if dep1.is_indirect() or dep2.is_indirect():
+            return False
+        normalize_dep1 = dep1.normalize_with_stride_order()
+        normalize_dep2 = dep2.normalize_with_stride_order()
+        if (
+            normalize_dep1.name == normalize_dep2.name
+            and normalize_dep1.index == normalize_dep2.index
+            and normalize_dep1.get_free_sym_ranges() == normalize_dep2.get_free_sym_ranges()
+            and normalize_dep1.mode == normalize_dep2.mode
+        ):
+            return True
+        return False
+           
+
+    def shared_data_with_common_index(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        if any(
+            n.is_cpu() for n in [node1, node2]
+        ):
+            return 0
+
+        node1_buffer_names = node1.read_writes.buffer_names()
+        node2_buffer_names = node2.read_writes.buffer_names()
+        # Fast path: no common buffers.
+        common_buffer_names = node1_buffer_names & node2_buffer_names
+        if not common_buffer_names:
+            return 0
+
+        node1_name2dep = {dep.name: dep for dep in node1.read_writes.reads_and_writes()}
+        node2_name2dep = {dep.name: dep for dep in node2.read_writes.reads_and_writes()}
+
+        # Find the commons buffers that has different loop orders
+        candidates = []
+        for buffer_name in common_buffer_names:
+            lhs_dep = node1_name2dep[buffer_name]
+            rhs_dep = node2_name2dep[buffer_name]
+            if self.compare_dep_with_free_symbol(lhs_dep, rhs_dep):
+                # print(f"Candidate : {lhs_dep} & {rhs_dep}")
+                candidates.append(
+                    (
+                        V.graph.sizevars.size_hint(lhs_dep.get_numel(), fallback=0),
+                        lhs_dep,
+                        rhs_dep,
+                    )
+                )
+
+        if len(candidates) == 0:
+            return 0
+
+        # Pick the largest buffer to guide the loop reordering
+        numel, lhs_dep, rhs_dep = max(candidates, key=lambda x: x[0])
+
+        if lhs_dep.num_vars != rhs_dep.num_vars:
+            # this can happen due to we don't merge loops.
+            # We can not do loop reordering in this case right now
+            # Simply returning true if the two Deps are the same after
+            # normalization (merging loops)
+            if lhs_dep.normalize() == rhs_dep.normalize():
+                return self.dep_size_hint(lhs_dep)
+            return 0
+
+        # Only reorder loops for pointwise for now
+        if not node1.is_reduction():
+            node1.reorder_loops_by_dep_pair(lhs_dep, rhs_dep)
+        elif not node2.is_reduction():
+            node2.reorder_loops_by_dep_pair(rhs_dep, lhs_dep)
+        else:
+            loop_ordering_log.debug(
+                "Don't reorder loops since both nodes are reductions: %s v.s. %s",
+                node1.get_name(),
+                node2.get_name(),
+            )
+
+        return self.score_fusion_memory_with_index(node1, node2)
+
     def unfusable_node(self, node: BaseSchedulerNode) -> bool:
         """
         Is this node unfusable under any conditions.
@@ -3222,6 +3354,10 @@ class Scheduler:
         shared_data_score = self.score_fusion_memory(node1, node2)
         if shared_data_score == 0:
             shared_data_score = self.shared_data_after_reordering_loop(node1, node2)
+        ################################ WELDER / ASTITCH ####################################
+        if shared_data_score == 0 and config.common_indexing_fusion:
+            shared_data_score = self.shared_data_with_common_index(node1, node2)
+        ######################################################################################
 
         if loop_ordering_log.isEnabledFor(logging.DEBUG):
             loop_ordering_log.debug(
@@ -3419,6 +3555,17 @@ class Scheduler:
             node2.read_writes.reads | node2.read_writes.writes
         )
         return sum(self.dep_size_hint(dep) for dep in common_memory_deps)
+    
+    def score_fusion_memory_with_index(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        score = 0
+        for dep1 in itertools.chain(node1.read_writes.reads, node1.read_writes.writes):
+            for dep2 in itertools.chain(node2.read_writes.reads, node2.read_writes.writes):
+                if self.compare_dep_with_free_symbol(dep1, dep2):
+                    score += self.dep_size_hint(dep1)
+        return score
+
 
     def get_possible_fusions_with_highest_priority(
         self, possible_fusions: List[Tuple[BaseSchedulerNode, BaseSchedulerNode]]
