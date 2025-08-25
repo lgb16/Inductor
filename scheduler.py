@@ -850,53 +850,14 @@ class BaseSchedulerNode:
     def get_template_node(self) -> Optional[ir.TemplateBuffer]:
         return None
 
+    ##################################### WELDER / ASTITCH ##############################################
     def propagate_default_tile(self):
-        var_in_reads = set([name for dep in self.read_writes.reads for name in dep.index.free_symbols])
-        var_in_writes = set([name for dep in self.read_writes.writes for name in dep.index.free_symbols])
-
-        common_vars = var_in_reads & var_in_writes
-
-        updated_range_vars = {
-            key: 1 if key in common_vars else value
-            for key, value in self.read_writes.var_ranges.items()
-        }
-
-        name_to_tile: Dict[str, Dict[sympy.Symbol, sympy.Expr]] = {}
-        for dep in self.read_writes.reads_and_writes():
-            name_to_tile[dep.name] = {}
-            for name in dep.index.free_symbols:
-                range_vars = updated_range_vars.get(name)
-                if range_vars is None:
-                    continue
-                name_to_tile[dep.name][name] = range_vars
-        ## TODO
-        ## dep가 StarDep, WeakDep인 경우의 handling
-        ## inderect로 생성되는 tmp handling
-
-        return name_to_tile
+        return None
 
     def propagate_output_tile(self, tile_var_ranges: Dict[str, Dict[sympy.Symbol, sympy.Expr]]):
-        default_tile_ranges = self.propagate_default_tile()
-
-        for buf_name, tile_range in default_tile_ranges.items():
-            p_tile_range = tile_var_ranges.get(buf_name)
-            if p_tile_range is None:
-                continue
-            for var, size in tile_range.items():
-                if size == 1 and p_tile_range[var] != 1:
-                    tile_range[var] = p_tile_range[var]
-                elif size != 1 and p_tile_range[var] == 1:
-                    ## TODO
-                    ## reduction에 대한 propagate handling
-                    continue
-                elif size == p_tile_range[var]:
-                    continue
-                else:
-                    ## default tile size는 항상 1을 가져간다고 가정
-                    ## p_tile_range는 propagate해서 온 결과이기 때문에 임의의 size를 가질 수 있지만,
-                    ## tile_range는 default_tile을 계산했기 떄문에 1 또는 tensor_size의 값만을 가짐(가정)
-                    return None
-        return default_tile_ranges
+        return None
+    
+    #####################################################################################################
 
 
 class WhyNoFuse:
@@ -1246,6 +1207,57 @@ class SchedulerNode(BaseSchedulerNode):
                         else (node.args[1] if len(node.args) >= 2 else "")
                     )
         return buffers_store_as_atomic_add
+    
+    ##################################### WELDER / ASTITCH ##############################################
+    def propagate_default_tile(self):
+        var_in_reads = set([name for dep in self.read_writes.reads for name in dep.index.free_symbols])
+        var_in_writes = set([name for dep in self.read_writes.writes for name in dep.index.free_symbols])
+
+        common_vars = var_in_reads & var_in_writes
+
+        updated_range_vars = {
+            key: 1 if key in common_vars else value
+            for key, value in self.read_writes.var_ranges.items()
+        }
+
+        name_to_tile: Dict[str, Dict[sympy.Symbol, sympy.Expr]] = {}
+        for dep in self.read_writes.reads_and_writes():
+            name_to_tile[dep.name] = {}
+            for name in dep.index.free_symbols:
+                range_vars = updated_range_vars.get(name)
+                if range_vars is None:
+                    continue
+                name_to_tile[dep.name][name] = range_vars
+        ## TODO
+        ## dep가 StarDep, WeakDep인 경우의 handling
+        ## inderect로 생성되는 tmp handling
+
+        return name_to_tile
+
+    def propagate_output_tile(self, tile_var_ranges: Dict[str, Dict[sympy.Symbol, sympy.Expr]]):
+        default_tile_ranges = self.propagate_default_tile()
+
+        for buf_name, tile_range in default_tile_ranges.items():
+            p_tile_range = tile_var_ranges.get(buf_name)
+            if p_tile_range is None:
+                continue
+            for var, size in tile_range.items():
+                if size == 1 and p_tile_range[var] != 1:
+                    tile_range[var] = p_tile_range[var]
+                elif size != 1 and p_tile_range[var] == 1:
+                    ## TODO
+                    ## reduction에 대한 propagate handling
+                    continue
+                elif size == p_tile_range[var]:
+                    continue
+                else:
+                    ## default tile size는 항상 1을 가져간다고 가정
+                    ## p_tile_range는 propagate해서 온 결과이기 때문에 임의의 size를 가질 수 있지만,
+                    ## tile_range는 default_tile을 계산했기 떄문에 1 또는 tensor_size의 값만을 가짐(가정)
+                    return None
+        return default_tile_ranges
+    
+    #####################################################################################################
 
 
 def refresh_group_node_dependencies(group_snode: BaseSchedulerNode) -> None:
@@ -1285,6 +1297,31 @@ def init_group_node(
         buf.get_name(): buf for buf in group_snode.get_outputs()
     }
 
+######################## WELDER / ASTITCH ########################
+def merge_tile_ranges(
+    name_to_tile_range_1: Dict[str, Dict[sympy.Symbol, sympy.Expr]],
+    name_to_tile_range_2: Dict[str, Dict[sympy.Symbol, sympy.Expr]],
+) -> Dict[str, Dict[sympy.Symbol, sympy.Expr]]:
+    merged_range = {}
+    merged_range.update(name_to_tile_range_1)
+    
+    for name, tile_range in name_to_tile_range_2.items():
+        if name in merged_range:
+            if merged_range[name] == tile_range:
+                pass
+            else:
+                for var, size in tile_range.items():
+                    if size != 1 and merged_range[name][var] == 1:
+                        merged_range[name][var] = size
+                    elif (size == 1 and merged_range[name][var]) or (size == merged_range[name][var]):
+                        continue
+                    else:
+                        return None
+        else:
+            merged_range[name] = tile_range
+            
+    return merged_range
+##############################################################
 
 class FusedSchedulerNode(BaseSchedulerNode):
     """
@@ -1471,6 +1508,44 @@ class FusedSchedulerNode(BaseSchedulerNode):
             log.warning("Ignoring error in debug_str()", exc_info=True)
 
         return buf.getrawvalue().rstrip()
+    
+    ##################################### WELDER / ASTITCH ##############################################
+    def propagate_default_tile(self):
+        topo_nodes = self.scheduler.topological_sort_schedule(self.snodes)
+        topo_nodes.reverse()
+
+        fused_tile_ranges = topo_nodes[0].propagate_default_tile()
+        if fused_tile_ranges is None:
+            return None
+        for node in topo_nodes[1:]:
+            propagate_tile_ranges = node.propagate_output_tile(fused_tile_ranges)
+            if propagate_tile_ranges is None:
+                return None
+            fused_tile_ranges = merge_tile_ranges(fused_tile_ranges, propagate_tile_ranges)
+            if fused_tile_ranges is None:
+                return None           
+
+        return fused_tile_ranges
+    
+
+    def propagate_output_tile(self, tile_var_ranges: Dict[str, Dict[sympy.Symbol, sympy.Expr]]):
+        topo_nodes = self.scheduler.topological_sort_schedule(self.snodes)
+        topo_nodes.reverse()
+
+        fused_tile_ranges = topo_nodes[0].propagate_output_tile(tile_var_ranges)
+        if fused_tile_ranges is None:
+            return None
+        for node in topo_nodes[1:]:
+            propagate_tile_ranges = node.propagate_output_tile(fused_tile_ranges)
+            if propagate_tile_ranges is None:
+                return None
+            fused_tile_ranges = merge_tile_ranges(fused_tile_ranges, propagate_tile_ranges)
+            if fused_tile_ranges is None:
+                return None           
+
+        return fused_tile_ranges
+    
+    #####################################################################################################
 
 
 class ForeachKernelSchedulerNode(FusedSchedulerNode):
@@ -2004,6 +2079,9 @@ class Scheduler:
             self.name_to_fused_node,
         )
 
+        if config.print_var_ranges:
+            self.print_nodes_var_ranges("Pre_fusion")
+
         metrics.ir_nodes_pre_fusion += len(self.nodes)
         V.debug.ir_pre_fusion(self.nodes)
         self.num_orig_nodes = len(self.nodes)
@@ -2034,6 +2112,9 @@ class Scheduler:
         V.debug.ir_post_fusion(self.nodes)
         V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
+
+        # if config.print_var_ranges:
+            # self.print_nodes_var_ranges()
 
         # used during codegen:
         self.buffer_names_to_free: OrderedSet[str] = OrderedSet()
@@ -3928,6 +4009,32 @@ class Scheduler:
                         V.graph.zero_dim_cpu_tensor_list.add(read.name)
 
     ################################## WELDER / ASTITCH #########################################
+    def print_nodes_var_ranges(self, text) -> None:
+        buffer_names_grouping = defaultdict(lambda: {"reads": [], "writes": []})
+        print("\n", text, "\n")
+        for node in self.nodes:
+            if self.unfusable_node(node):
+                continue
+            for buf in node.read_writes.reads:
+                if not isinstance(buf, MemoryDep):
+                    buffer_names_grouping[buf.name]["reads"].append((node.get_name(), "not MemoryDep"))
+                else:
+                    buffer_names_grouping[buf.name]["reads"].append((node.get_name(), buf.index, buf.ranges))
+            for buf in node.read_writes.writes:
+                if not isinstance(buf, MemoryDep):
+                    buffer_names_grouping[buf.name]["writes"].append((node.get_name(), "not MemoryDep"))
+                else:
+                    buffer_names_grouping[buf.name]["writes"].append((node.get_name(), buf.index, buf.ranges))
+        for buf, access in buffer_names_grouping.items():
+            print('\n', buf)
+            if access["reads"]:
+                print("reads:")
+                for r in access["reads"]:
+                    print(f"  {r}")
+            if access["writes"]:
+                print("writes:")
+                for w in access["writes"]:
+                    print(f"  {w}")
     
     def try_loop_split(self, nodes: List[SchedulerNode]):
         """
