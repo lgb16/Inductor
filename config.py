@@ -536,8 +536,10 @@ aggressive_tiling_fusion = False
 
 switch_debuging_code = False
 common_indexing_fusion = False
+force_matching_index = False
 
 print_var_ranges = False
+always_skip_benchmark = False
 ##########################################################################################
 
 

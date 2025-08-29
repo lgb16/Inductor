@@ -1210,8 +1210,18 @@ class SchedulerNode(BaseSchedulerNode):
     
     ##################################### WELDER / ASTITCH ##############################################
     def propagate_default_tile(self):
-        var_in_reads = set([name for dep in self.read_writes.reads for name in dep.index.free_symbols])
-        var_in_writes = set([name for dep in self.read_writes.writes for name in dep.index.free_symbols])
+        var_in_reads = set([
+            name
+            for dep in self.read_writes.reads
+            if isinstance(dep, MemoryDep)
+            for name in dep.index.free_symbols
+        ])
+        var_in_writes = set([
+            name
+            for dep in self.read_writes.writes
+            if isinstance(dep, MemoryDep)
+            for name in dep.index.free_symbols
+        ])
 
         common_vars = var_in_reads & var_in_writes
 
@@ -1222,6 +1232,8 @@ class SchedulerNode(BaseSchedulerNode):
 
         name_to_tile: Dict[str, Dict[sympy.Symbol, sympy.Expr]] = {}
         for dep in self.read_writes.reads_and_writes():
+            if not isinstance(dep, MemoryDep):
+                continue
             name_to_tile[dep.name] = {}
             for name in dep.index.free_symbols:
                 range_vars = updated_range_vars.get(name)
@@ -2736,6 +2748,8 @@ class Scheduler:
         If config.benchmark_fusion is False, always return True.
         Otherwise, return True if fusion can brings speedup.
         """
+        if config.always_skip_benchmark:
+            return True
 
         is_multi_template = node1.is_template() and isinstance(
             node1.get_template_node(), ir.MultiTemplateBuffer
@@ -3363,6 +3377,14 @@ class Scheduler:
             )
 
         return self.score_fusion_memory_with_index(node1, node2)
+    
+    def shared_data_with_match_index(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> int:
+        
+        return self.score_fusion_memory_with_index(node1, node2)
+
+    ###########################################################################
 
     def unfusable_node(self, node: BaseSchedulerNode) -> bool:
         """
@@ -3438,6 +3460,8 @@ class Scheduler:
         ################################ WELDER / ASTITCH ####################################
         if shared_data_score == 0 and config.common_indexing_fusion:
             shared_data_score = self.shared_data_with_common_index(node1, node2)
+        if shared_data_score == 0 and config.force_matching_index:
+            shared_data_score = seld.shared_data_with_match_index(node1, node2)
         ######################################################################################
 
         if loop_ordering_log.isEnabledFor(logging.DEBUG):
